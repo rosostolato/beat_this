@@ -246,15 +246,19 @@ class AudioPreprocessing(object):
         folder_path = Path(self.audio_dir, "mono_tracks", dataset_name, audio_path.stem)
         # derive the name of the unaugmented file
         mono_path = folder_path / f"track.{self.ext}"
-        # derive the name of all augmented files
-        augmentations = {
-            "pitch": {"min": self.pitch_shift[0], "max": self.pitch_shift[1]},
-            "tempo": {
+        # derive the name of all augmented files (skip a kind if disabled)
+        augmentations = {}
+        if self.pitch_shift:
+            augmentations["pitch"] = {
+                "min": self.pitch_shift[0],
+                "max": self.pitch_shift[1],
+            }
+        if self.time_stretch:
+            augmentations["tempo"] = {
                 "min": -self.time_stretch[0],
                 "max": self.time_stretch[0],
                 "stride": self.time_stretch[1],
-            },
-        }
+            }
         augmentations_path = precomputed_augmentation_filenames(augmentations, self.ext)
         # stop here if all files exists
         if mono_path.exists() and all(
@@ -394,8 +398,8 @@ def create_npz(spect_dir, npz_file, augmentations, verbose):
 
 
 def ints(value):
-    """Parse a string containing a colon-separated tuple of integers."""
-    return value and tuple(map(int, value.split(":")))
+    """Parse a colon-separated tuple of integers; empty -> None (disabled)."""
+    return tuple(map(int, value.split(":"))) if value else None
 
 
 def main(orig_audio_paths, pitch_shift, time_stretch, verbose):

@@ -1,11 +1,15 @@
-__pycache__/
-*.py[cod]
-*$py.class
-
-data/
+# data + artifacts (live on the pod / gdrive, not in git)
+/data/
 checkpoints/
-lightning_logs/
-wandb/
-.vscode/
-beat_this.egg-info/
-build/
+logs/
+*.ckpt
+*.npy
+*.npz
+*.tar
+*.tar.gz
+__pycache__/
+*.pyc
+scripts/upload_stage/
+*.egg-info/
+.venv/
+scripts/

@@ -12,17 +12,24 @@ class Postprocessor:
     and returns the postprocessed beat and downbeat as list of times in seconds.
     The beats and downbeats can be 1D arrays (for only 1 piece) or 2D arrays, if a batch of pieces is considered.
     The output dimensionality is the same as the input dimensionality.
-    Two types of postprocessing are implemented:
+    Three types of postprocessing are implemented:
         - minimal: a simple postprocessing that takes the maximum of the framewise predictions,
         and removes adjacent peaks.
         - dbn: a postprocessing based on the Dynamic Bayesian Network proposed by Böck et al.
+        (joint beat+bar tracking; forces a 3/4 or 4/4 meter).
+        - hmm: beat-only DBN (madmom DBNBeatTrackingProcessor, no meter model) to fix the
+        beat grid, with the model's ORIGINAL downbeat peaks snapped onto that grid. Avoids the
+        bar model's tempo-halving (raised min_bpm) and 3/4-4/4 forcing (no meter), while keeping
+        the model's own downbeats. This is the default for File2Beats.
     Args:
-        type (str): the type of postprocessing to apply. Either "minimal" or "dbn". Default is "minimal".
+        type (str): the type of postprocessing to apply. "minimal", "dbn", or "hmm". Default is "minimal".
         fps (int): the frames per second of the model framewise predictions. Default is 50.
+        min_bpm (float): tempo floor for the "hmm" beat tracker (default 80, which excludes the
+        half-tempo state responsible for beat-halving on quiet sections).
     """
 
-    def __init__(self, type: str = "minimal", fps: int = 50):
-        assert type in ["minimal", "dbn"]
+    def __init__(self, type: str = "minimal", fps: int = 50, min_bpm: float = 80.0):
+        assert type in ["minimal", "dbn", "hmm"]
         self.type = type
         self.fps = fps
         if type == "dbn":
@@ -31,6 +38,15 @@ class Postprocessor:
             self.dbn = DBNDownBeatTrackingProcessor(
                 beats_per_bar=[3, 4],
                 min_bpm=55.0,
+                max_bpm=215.0,
+                fps=self.fps,
+                transition_lambda=100,
+            )
+        elif type == "hmm":
+            from madmom.features.beats import DBNBeatTrackingProcessor
+
+            self.beat_dbn = DBNBeatTrackingProcessor(
+                min_bpm=min_bpm,
                 max_bpm=215.0,
                 fps=self.fps,
                 transition_lambda=100,
@@ -71,6 +87,8 @@ class Postprocessor:
             )
         elif self.type == "dbn":
             postp_beat, postp_downbeat = self.postp_dbn(beat, downbeat, padding_mask)
+        elif self.type == "hmm":
+            postp_beat, postp_downbeat = self.postp_hmm(beat, downbeat, padding_mask)
         else:
             raise ValueError("Invalid postprocessing type")
 
@@ -171,6 +189,34 @@ class Postprocessor:
         postp_beat = dbn_out[:, 0]
         postp_downbeat = dbn_out[dbn_out[:, 1] == 1][:, 0]
         return postp_beat, postp_downbeat
+
+    def postp_hmm(self, beat, downbeat, padding_mask):
+        beat_prob = beat.double().sigmoid()
+        epsilon = 1e-5
+        beat_prob = beat_prob * (1 - epsilon) + epsilon / 2
+        with ThreadPoolExecutor() as executor:
+            postp_beat, postp_downbeat = zip(
+                *executor.map(self._postp_hmm_item, beat_prob, downbeat, padding_mask)
+            )
+        return postp_beat, postp_downbeat
+
+    def _postp_hmm_item(self, padded_beat_prob, padded_downbeat_logit, mask):
+        # beat grid: beat-only DBN on the beat activation (no meter model)
+        beat_prob = padded_beat_prob[mask].cpu().numpy()
+        beat_time = np.sort(self.beat_dbn(beat_prob))
+        # original downbeats: peak-pick the model's downbeat logits (max within +/-70ms, prob>0.5)
+        dl = padded_downbeat_logit[mask].double().reshape(1, -1)
+        peaks = (dl == F.max_pool1d(dl, 7, 1, 3)) & (dl > 0)
+        downbeat_frame = deduplicate_peaks(
+            torch.nonzero(peaks[0]).cpu().numpy()[:, 0], width=1
+        )
+        downbeat_time = downbeat_frame / self.fps
+        # snap each original downbeat to the nearest DBN beat (never off the grid)
+        if len(beat_time) > 0:
+            for i, d_time in enumerate(downbeat_time):
+                downbeat_time[i] = beat_time[np.argmin(np.abs(beat_time - d_time))]
+        downbeat_time = np.unique(downbeat_time)
+        return beat_time, downbeat_time
 
 
 def deduplicate_peaks(peaks, width=1) -> np.ndarray:

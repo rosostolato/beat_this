@@ -46,14 +46,16 @@ class BeatThis(nn.Module):
         dropout: dict = {"frontend": 0.1, "transformer": 0.2},
         sum_head: bool = True,
         partial_transformers: bool = True,
+        spect_channels: int = 1,
     ):
         super().__init__()
+        self.spect_channels = spect_channels
         # shared rotary embedding for frontend blocks and transformer blocks
         rotary_embed = RotaryEmbedding(head_dim)
 
         # create the frontend
         # - stem
-        stem = self.make_stem(spect_dim, stem_dim)
+        stem = self.make_stem(spect_dim, stem_dim, n_channels=spect_channels)
         spect_dim //= 4  # frequencies were convolved with stride 4
         # - three frontend blocks
         frontend_blocks = []
@@ -106,14 +108,36 @@ class BeatThis(nn.Module):
         self.apply(self._init_weights)
 
     @staticmethod
-    def make_stem(spect_dim: int, stem_dim: int) -> nn.Module:
+    def make_stem(spect_dim: int, stem_dim: int, n_channels: int = 1) -> nn.Module:
+        if n_channels == 1:
+            # original single-channel stem (full mix). Kept byte-identical so the
+            # released checkpoints load unchanged. Input: (b, t, f).
+            return nn.Sequential(
+                OrderedDict(
+                    rearrange_tf=Rearrange("b t f -> b f t"),
+                    bn1d=nn.BatchNorm1d(spect_dim),
+                    add_channel=Rearrange("b f t -> b 1 f t"),
+                    conv2d=nn.Conv2d(
+                        in_channels=1,
+                        out_channels=stem_dim,
+                        kernel_size=(4, 3),
+                        stride=(4, 1),
+                        padding=(0, 1),
+                        bias=False,
+                    ),
+                    bn2d=nn.BatchNorm2d(stem_dim),
+                    activation=nn.GELU(),
+                )
+            )
+        # multi-channel stem (demixed stems stacked as channels, all-in-one style).
+        # Input: (b, c, t, f). The conv combines the c channels, so the model learns
+        # per-frame which stems carry the beat (and falls back when drums are absent).
         return nn.Sequential(
             OrderedDict(
-                rearrange_tf=Rearrange("b t f -> b f t"),
-                bn1d=nn.BatchNorm1d(spect_dim),
-                add_channel=Rearrange("b f t -> b 1 f t"),
+                rearrange_tf=Rearrange("b t c f -> b c f t"),
+                bn2d_in=nn.BatchNorm2d(n_channels),
                 conv2d=nn.Conv2d(
-                    in_channels=1,
+                    in_channels=n_channels,
                     out_channels=stem_dim,
                     kernel_size=(4, 3),
                     stride=(4, 1),

@@ -27,7 +27,14 @@ def load_checkpoint(checkpoint_path: str, device: str | torch.device = "cpu") ->
     try:
         # try interpreting as local file name
         weights_only = {"weights_only": True} if torch.__version__ >= "2" else {}
-        return torch.load(checkpoint_path, map_location=device, **weights_only)
+        try:
+            return torch.load(checkpoint_path, map_location=device, **weights_only)
+        except FileNotFoundError:
+            raise
+        except Exception:
+            # trusted local checkpoint (e.g. a Lightning .ckpt embedding numpy
+            # scalars) that torch>=2.6 rejects under weights_only=True
+            return torch.load(checkpoint_path, map_location=device, weights_only=False)
     except FileNotFoundError:
         try:
             if not (
@@ -289,14 +296,21 @@ class Audio2Beats(Audio2Frames):
         checkpoint_path (str): Path to the model checkpoint file. It can be a local path, a URL, or a key from the CHECKPOINT_URL dictionary. Default is "final0", which will load the model trained on all data except GTZAN with seed 0.
         device (str): Device to use for inference. Default is "cpu".
         float16 (bool): Whether to use half precision floating point arithmetic. Default is False.
-        dbn (bool): Whether to use the madmom DBN for post-processing. Default is False.
+        postprocessor (str): Postprocessing mode: "hmm" (default; beat-only DBN at min_bpm=80
+            with the model's original downbeats snapped to the grid — fixes tempo-halving and
+            odd meters), "minimal" (peak-pick, no madmom), or "dbn" (joint beat+bar DBN).
+        dbn (bool): Deprecated shortcut. If True, forces postprocessor="dbn"; if explicitly
+            False, forces "minimal" (legacy behaviour). Leave as None to use `postprocessor`.
     """
 
     def __init__(
-        self, checkpoint_path="final0", device="cpu", float16=False, dbn=False
+        self, checkpoint_path="final0", device="cpu", float16=False,
+        postprocessor="hmm", dbn=None
     ):
         super().__init__(checkpoint_path, device, float16)
-        self.frames2beats = Postprocessor(type="dbn" if dbn else "minimal")
+        if dbn is not None:
+            postprocessor = "dbn" if dbn else "minimal"
+        self.frames2beats = Postprocessor(type=postprocessor)
 
     def __call__(self, signal, sr):
         beat_logits, downbeat_logits = super().__call__(signal, sr)

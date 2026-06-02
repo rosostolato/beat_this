@@ -39,6 +39,7 @@ class PLBeatThis(LightningModule):
         eval_trim_beats=5,
         sum_head=True,
         partial_transformers=True,
+        spect_channels=1,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -56,6 +57,7 @@ class PLBeatThis(LightningModule):
             dropout=dropout,
             sum_head=sum_head,
             partial_transformers=partial_transformers,
+            spect_channels=spect_channels,
         )
         self.warmup_steps = warmup_steps
         self.max_epochs = max_epochs

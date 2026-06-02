@@ -44,8 +44,13 @@ class BeatTrackingDataset(Dataset):
         deterministic=False,
         augmentations={},
         length_based_oversampling_factor=0,
+        stem_channels=None,
     ):
         self.spect_basepath = data_folder / "audio" / "spectrograms"
+        # multi-channel demixed-stem mode: load+stack these stems as channels
+        # from data/audio/stem_spect/<id>/<stem>.npy. None = original full-mix.
+        self.stem_channels = stem_channels
+        self.stem_basepath = data_folder / "audio" / "stem_spect"
         self.annotation_basepath = data_folder / "annotations"
         self.fps = spect_fps
         self.train_length = train_length
@@ -94,16 +99,25 @@ class BeatTrackingDataset(Dataset):
         return spects
 
     def _load_dataset_item(self, item_name):
-        # stop if not all the augmented audio files are there
         dataset, remainder = item_name.split("/", 1)
-        for aug_filename in precomputed_augmentation_filenames(self.augmentations):
-            if (f"{remainder}/{aug_filename[:-4]}") not in self.spects.get(
-                dataset, ()
-            ) and not (self.spect_basepath / item_name / aug_filename).exists():
-                print(
-                    f"Skipping {item_name} because not all necessary spectrograms are there."
-                )
+        if self.stem_channels:
+            # stem mode: require all requested stem spectrograms for this id
+            if not all(
+                (self.stem_basepath / remainder / f"{s}.npy").exists()
+                for s in self.stem_channels
+            ):
+                print(f"Skipping {item_name} because not all stem spectrograms are there.")
                 return
+        else:
+            # stop if not all the augmented audio files are there
+            for aug_filename in precomputed_augmentation_filenames(self.augmentations):
+                if (f"{remainder}/{aug_filename[:-4]}") not in self.spects.get(
+                    dataset, ()
+                ) and not (self.spect_basepath / item_name / aug_filename).exists():
+                    print(
+                        f"Skipping {item_name} because not all necessary spectrograms are there."
+                    )
+                    return
 
         # load beat and produce a default if beat values are not found
         dataset, stem = item_name.split("/", 1)
@@ -136,7 +150,7 @@ class BeatTrackingDataset(Dataset):
         if dataset == "rwc":
             dataset = "rwc_" + stem.split("_", 2)[1]
         return {
-            "spect_path": Path(item_name) / "track.npy",
+            "spect_path": remainder if self.stem_channels else Path(item_name) / "track.npy",
             "beat_time": beat_time,
             "beat_value": beat_value,
             "downbeat_mask": downbeat_mask,
@@ -144,6 +158,16 @@ class BeatTrackingDataset(Dataset):
         }
 
     def _get_spect(self, item):
+        if self.stem_channels:
+            # stack requested stems as channels -> (channels, time, freq)
+            sid = str(item["spect_path"])
+            stems = [
+                np.load(self.stem_basepath / sid / f"{s}.npy", mmap_mode="r")
+                for s in self.stem_channels
+            ]
+            n = min(len(s) for s in stems)  # guard against off-by-one stem lengths
+            # time-first (T, C, F) so the excerpt/len/pad logic below is unchanged
+            return np.stack([s[:n] for s in stems], axis=1)
         try:
             dataset, filename = str(item["spect_path"]).split("/", 1)
             spect = self.spects[dataset][filename[:-4]]
@@ -232,8 +256,10 @@ class BeatTrackingDataset(Dataset):
 
             # pad all framewise tensors if needed
             if longer < 0:
+                # pad only the time axis (axis 0); works for (T,F) and (T,C,F)
+                spect_pad = [(0, -longer)] + [(0, 0)] * (item["spect"].ndim - 1)
                 item["spect"] = np.pad(
-                    item["spect"], [(0, -longer), (0, 0)], constant_values=0
+                    item["spect"], spect_pad, constant_values=0
                 )
                 for k in "truth_beat", "truth_downbeat":
                     item[k] = np.pad(item[k], [(0, -longer)], constant_values=0)
@@ -282,6 +308,7 @@ class BeatDataModule(pl.LightningDataModule):
         length_based_oversampling_factor=0,
         fold=None,
         predict_datasplit="test",
+        stem_channels=None,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -301,6 +328,7 @@ class BeatDataModule(pl.LightningDataModule):
         self.length_based_oversampling_factor = length_based_oversampling_factor
         self.fold = fold
         self.predict_datasplit = predict_datasplit
+        self.stem_channels = stem_channels
 
     def setup(self, stage):
         if self.initialized.get(stage, False):
@@ -372,6 +400,7 @@ class BeatDataModule(pl.LightningDataModule):
                 train_length=self.train_length,
                 data_folder=self.data_dir,
                 spect_fps=self.spect_fps,
+                stem_channels=self.stem_channels,
             )
             print(
                 "Validation set:",
@@ -390,6 +419,7 @@ class BeatDataModule(pl.LightningDataModule):
                 train_length=self.train_length,
                 data_folder=self.data_dir,
                 spect_fps=self.spect_fps,
+                stem_channels=self.stem_channels,
                 length_based_oversampling_factor=self.length_based_oversampling_factor,
             )
             print(
@@ -416,6 +446,7 @@ class BeatDataModule(pl.LightningDataModule):
                 train_length=None,
                 data_folder=self.data_dir,
                 spect_fps=self.spect_fps,
+                stem_channels=self.stem_channels,
             )
             print(
                 "Test set:", len(self.test_dataset), "items from:", self.test_set_name
@@ -443,6 +474,7 @@ class BeatDataModule(pl.LightningDataModule):
                     train_length=None,
                     data_folder=self.data_dir,
                     spect_fps=self.spect_fps,
+                stem_channels=self.stem_channels,
                 )
 
     def train_dataloader(self):
