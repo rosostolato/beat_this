@@ -28,10 +28,13 @@ class Postprocessor:
         half-tempo state responsible for beat-halving on quiet sections).
     """
 
-    def __init__(self, type: str = "minimal", fps: int = 50, min_bpm: float = 80.0):
+    def __init__(self, type: str = "minimal", fps: int = 50, min_bpm: float = 80.0,
+                 db_min_gap: int = 3):
         assert type in ["minimal", "dbn", "hmm"]
         self.type = type
         self.fps = fps
+        # 'hmm' downbeat NMS: drop downbeats within this many beats of a stronger one
+        self.db_min_gap = db_min_gap
         if type == "dbn":
             from madmom.features.downbeats import DBNDownBeatTrackingProcessor
 
@@ -205,17 +208,22 @@ class Postprocessor:
         beat_prob = padded_beat_prob[mask].cpu().numpy()
         beat_time = np.sort(self.beat_dbn(beat_prob))
         # original downbeats: peak-pick the model's downbeat logits (max within +/-70ms, prob>0.5)
-        dl = padded_downbeat_logit[mask].double().reshape(1, -1)
-        peaks = (dl == F.max_pool1d(dl, 7, 1, 3)) & (dl > 0)
-        downbeat_frame = deduplicate_peaks(
-            torch.nonzero(peaks[0]).cpu().numpy()[:, 0], width=1
-        )
-        downbeat_time = downbeat_frame / self.fps
-        # snap each original downbeat to the nearest DBN beat (never off the grid)
-        if len(beat_time) > 0:
-            for i, d_time in enumerate(downbeat_time):
-                downbeat_time[i] = beat_time[np.argmin(np.abs(beat_time - d_time))]
-        downbeat_time = np.unique(downbeat_time)
+        dl = padded_downbeat_logit[mask].double()
+        peaks = (dl == F.max_pool1d(dl.reshape(1, -1), 7, 1, 3)[0]) & (dl > 0)
+        frames = deduplicate_peaks(torch.nonzero(peaks).cpu().numpy()[:, 0], width=1)
+        if len(beat_time) == 0 or len(frames) == 0:
+            return beat_time, np.array([])
+        dl_np = dl.cpu().numpy()
+        # snap each downbeat to the nearest DBN beat (never off the grid); strength =
+        # downbeat logit at the peak, used for non-maximum suppression
+        idx = np.array([int(np.argmin(np.abs(beat_time - f / self.fps))) for f in frames])
+        strength = np.array([dl_np[min(int(round(f)), len(dl_np) - 1)] for f in frames])
+        # NMS: keep the strongest; drop any downbeat within db_min_gap beats of a kept one
+        kept = []
+        for k in np.argsort(-strength):
+            if all(abs(int(idx[k]) - j) >= self.db_min_gap for j in kept):
+                kept.append(int(idx[k]))
+        downbeat_time = beat_time[np.array(sorted(set(kept)))]
         return beat_time, downbeat_time
 
 
